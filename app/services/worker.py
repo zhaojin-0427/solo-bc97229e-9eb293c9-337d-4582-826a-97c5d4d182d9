@@ -2,8 +2,13 @@
 
 Runs inside each API process as a daemon thread. Cross-process safety comes
 from the atomic run claim in ``CheckRepository``: of the two processes only
-one can claim a given run. If a process dies, the other process's claim
-logic reaps the stale heartbeat and re-verifies the newest state itself.
+one can claim a given run, and every claim rotates a fencing token. If a
+process stalls (heartbeat goes stale while its thread is still alive), the
+other process's claim logic reaps the run, wipes the old attempt's on-disk
+working partition, and re-verifies the bound version itself. The stalled
+thread's token no longer matches, so every heartbeat/conclusion/release
+write it attempts afterwards is rejected — it can never corrupt its
+successor.
 
 Startup reconciliation guarantees that after a crash/restart the latest data
 version always has a fresh run, no old acceptance is restored, and nothing is
@@ -71,6 +76,9 @@ class VerificationWorker:
         # Immediate reconciliation after boot handles restart scenarios.
         try:
             self.reconcile()
+            # Reclaim disk partitions left behind by processes that died
+            # before their own cleanup; keeps the shared check.db bounded.
+            self.check.purge_orphan_working_state()
         except Exception:  # noqa: BLE001
             logger.exception("startup reconciliation failed")
         while not self._stop.wait(settings.poll_interval):

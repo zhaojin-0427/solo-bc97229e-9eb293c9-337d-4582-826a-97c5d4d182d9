@@ -156,7 +156,12 @@ CREATE TABLE IF NOT EXISTS verifier_run (
     error_message       TEXT,
     attempts            INTEGER NOT NULL DEFAULT 0,
     worker_id           TEXT,
-    heartbeat_at        TEXT
+    heartbeat_at        TEXT,
+    -- Fencing token rotated on every (re)claim. All progress/conclusion
+    -- writes must carry the token they were claimed with, so a worker whose
+    -- heartbeat timed out and lost the run can never touch its successor's
+    -- state after it wakes up.
+    claim_token         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_version ON verifier_run(data_version);
@@ -180,39 +185,92 @@ CREATE INDEX IF NOT EXISTS idx_conflict_run ON verifier_conflict(run_id);
 -- Disk-backed working tables for the streaming verifier. Keeping the
 -- adjacency, BFS frontier and parent pointers in SQLite means the Python
 -- process never holds the full graph or all search state in memory.
+--
+-- Every (re)claim of a run works on its own attempt_no partition. When a
+-- stale worker is reaped and another process re-claims the run, the zombie's
+-- in-flight writes stay confined to the old partition and can neither
+-- corrupt nor erase the successor's search data. Partitions of attempts that
+-- no longer own the run are garbage-collected during reclaim/startup, so the
+-- disk footprint stays bounded.
 CREATE TABLE IF NOT EXISTS verifier_edge (
-    run_id INTEGER NOT NULL,
-    u      TEXT NOT NULL,
-    v      TEXT NOT NULL
+    run_id     INTEGER NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    u          TEXT NOT NULL,
+    v          TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_ve_run_u ON verifier_edge(run_id, u);
+CREATE INDEX IF NOT EXISTS idx_ve_run_attempt_u
+    ON verifier_edge(run_id, attempt_no, u);
 
 CREATE TABLE IF NOT EXISTS verifier_vertex (
     run_id       INTEGER NOT NULL,
+    attempt_no   INTEGER NOT NULL,
     sample_no    TEXT NOT NULL,
     grp          TEXT,
     component_id INTEGER,
     visited      INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_vv_run_visited
-    ON verifier_vertex(run_id, visited);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_vv_run_sample
-    ON verifier_vertex(run_id, sample_no);
+CREATE INDEX IF NOT EXISTS idx_vv_run_attempt_visited
+    ON verifier_vertex(run_id, attempt_no, visited);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vv_run_attempt_sample
+    ON verifier_vertex(run_id, attempt_no, sample_no);
 
 CREATE TABLE IF NOT EXISTS verifier_frontier (
-    run_id    INTEGER NOT NULL,
-    sample_no TEXT NOT NULL
+    run_id     INTEGER NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    sample_no  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_vf_run ON verifier_frontier(run_id);
+CREATE INDEX IF NOT EXISTS idx_vf_run_attempt
+    ON verifier_frontier(run_id, attempt_no);
 
 CREATE TABLE IF NOT EXISTS verifier_parent (
-    run_id INTEGER NOT NULL,
-    child  TEXT NOT NULL,
-    parent TEXT NOT NULL
+    run_id     INTEGER NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    child      TEXT NOT NULL,
+    parent     TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_vp_run_child
-    ON verifier_parent(run_id, child);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vp_run_attempt_child
+    ON verifier_parent(run_id, attempt_no, child);
 """
+
+
+# Tables that hold per-attempt verifier search state. An earlier schema
+# version keyed them by run_id alone, which let a reclaimed zombie overwrite
+# or delete its successor's working data. They are rebuilt on upgrade.
+_WORKING_TABLES = (
+    "verifier_edge",
+    "verifier_vertex",
+    "verifier_frontier",
+    "verifier_parent",
+)
+
+
+def _migrate_check_schema(conn: sqlite3.Connection) -> None:
+    """Bring an existing check.db up to the ownership-fencing schema."""
+    has_run_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='verifier_run'"
+    ).fetchone()
+    if has_run_table:
+        columns = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(verifier_run)").fetchall()
+        }
+        if "claim_token" not in columns:
+            conn.execute(
+                "ALTER TABLE verifier_run ADD COLUMN claim_token TEXT"
+            )
+    has_edge_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='verifier_edge'"
+    ).fetchone()
+    if has_edge_table:
+        edge_columns = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(verifier_edge)").fetchall()
+        }
+        if "attempt_no" not in edge_columns:
+            # Pre-upgrade search state is unkeyed and unsafe to share across
+            # attempts; drop it so the DDL recreates the partitioned tables.
+            for table in _WORKING_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 def init_databases() -> None:
@@ -221,4 +279,6 @@ def init_databases() -> None:
         (CHECK_SCHEMA, settings.check_db),
     ):
         with transaction(path) as conn:
+            if path == settings.check_db:
+                _migrate_check_schema(conn)
             conn.executescript(ddl)
